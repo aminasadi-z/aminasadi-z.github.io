@@ -91,7 +91,7 @@
 (function () {
   "use strict";
   var $ = function (id) { return document.getElementById(id); };
-  var SEND_INTERVAL_MS = 300; // ~3 Hz
+  var SEND_INTERVAL_MS = 100; // ~10 Hz
   var ICE_TIMEOUT_MS = 2500;
 
   var pc = null, channel = null, watchId = null, wakeLock = null, lastSent = 0, running = false;
