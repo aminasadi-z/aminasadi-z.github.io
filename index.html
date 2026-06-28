@@ -97,6 +97,7 @@
   var pc = null, channel = null, watchId = null, wakeLock = null, lastSent = 0, running = false;
   var compassHeading = null; // latest IMU compass heading (deg, 0=N), used when slow
   var GPS_HEADING_MIN_SPEED = 2.0; // m/s (~7 km/h): above this, trust GPS course
+  var lastCoords = null; // last known position, so compass-only updates can be sent
 
   function setPeer(t, c) { $("peerText").textContent = t; $("peerDot").className = "dot" + (c ? " " + c : ""); }
   function setGps(t, c)  { $("gpsText").textContent = t;  $("gpsDot").className  = "dot" + (c ? " " + c : ""); }
@@ -197,6 +198,7 @@
     $("lon").textContent = c.longitude.toFixed(6);
     $("speed").textContent = (c.speed != null ? (c.speed * 3.6).toFixed(1) + " km/h" : "—");
     $("acc").textContent = (c.accuracy != null ? c.accuracy.toFixed(0) + " m" : "—");
+    lastCoords = c;
 
     var now = Date.now();
     if (now - lastSent < SEND_INTERVAL_MS) return;
@@ -239,6 +241,20 @@
     var h = (typeof e.webkitCompassHeading === "number") ? e.webkitCompassHeading
           : (e.alpha != null ? (360 - e.alpha) : null);
     if (h != null && isFinite(h)) compassHeading = (h % 360 + 360) % 360;
+    // GPS rarely fires while parked, so push heading-only updates from the
+    // compass when stationary; otherwise the heading would appear frozen.
+    var c = lastCoords;
+    if (c == null || compassHeading == null) return;
+    if (c.speed != null && c.speed >= GPS_HEADING_MIN_SPEED) return;
+    var now = Date.now();
+    if (now - lastSent < SEND_INTERVAL_MS) return;
+    lastSent = now;
+    if (channel && channel.readyState === "open") {
+      channel.send(JSON.stringify({
+        type: "gps", lat: c.latitude, lon: c.longitude,
+        heading: compassHeading, speed: c.speed, acc: c.accuracy, ts: now
+      }));
+    }
   }
   async function requestCompass() {
     try {
@@ -281,6 +297,7 @@
     if (watchId != null) { navigator.geolocation.clearWatch(watchId); watchId = null; }
     window.removeEventListener("deviceorientation", onOrientation, true);
     compassHeading = null;
+    lastCoords = null;
     if (wakeLock) { try { wakeLock.release(); } catch (e) {} wakeLock = null; }
   }
   toggle.addEventListener("click", function () { running ? stop() : start(); });
