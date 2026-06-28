@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<title>Drift Live GPS — Pair</title>
+<!--
+  Drift Live GPS sender (serverless WebRTC answerer).
+
+  Host this single file on GitHub Pages (or any static HTTPS host). Drift shows
+  an offer QR whose URL points here with the offer in the hash (#o=...). This
+  page answers, shows an answer QR for Drift's webcam to read, then streams the
+  phone's GPS to Drift over a peer-to-peer DataChannel. No server, no relay.
+-->
+<script src="https://cdn.jsdelivr.net/npm/pako@2.1.0/dist/pako.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.js"></script>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body {
+    margin: 0; min-height: 100vh; font-family: -apple-system, system-ui, sans-serif;
+    background: radial-gradient(circle at 50% 0%, #18203a 0%, #0a0d18 70%);
+    color: #e7ecff; display: flex; flex-direction: column; align-items: center;
+    padding: env(safe-area-inset-top) 20px env(safe-area-inset-bottom);
+  }
+  h1 { font-size: 20px; font-weight: 700; letter-spacing: .5px; margin: 24px 0 4px; }
+  .sub { font-size: 13px; color: #8a93b8; margin-bottom: 18px; text-align: center; }
+  .rows { width:100%; max-width:360px; margin-bottom: 16px; }
+  .row { display:flex; align-items:center; gap:8px; font-size:13px; padding:5px 0; }
+  .row .lbl { color:#8a93b8; width:64px; flex:none; text-transform:uppercase; font-size:11px; letter-spacing:.5px; }
+  .row .val { flex:1; }
+  .dot { width:9px; height:9px; border-radius:50%; background:#5a6080; flex:none; }
+  .dot.on { background:#33d17a; box-shadow:0 0 8px #33d17a; }
+  .dot.warn { background:#f5b50b; box-shadow:0 0 8px #f5b50b; }
+  .dot.err { background:#ff5c5c; box-shadow:0 0 8px #ff5c5c; }
+  button {
+    appearance:none; border:none; border-radius:18px; font-size:18px; font-weight:700;
+    padding:18px 36px; width:100%; max-width:360px; color:#06210f;
+    background:linear-gradient(180deg,#4ade80,#22c55e); box-shadow:0 8px 30px rgba(34,197,94,.35);
+    transition:transform .08s ease; cursor:pointer;
+  }
+  button:active { transform:scale(.97); }
+  button.stop { color:#2a0a0a; background:linear-gradient(180deg,#ff6b6b,#ef4444);
+                box-shadow:0 8px 30px rgba(239,68,68,.35); }
+  .qr-card {
+    background:#fff; border-radius:16px; padding:14px; margin:6px 0 16px;
+    width: 86vw; max-width: 360px; display:flex; align-items:center; justify-content:center;
+  }
+  .qr-card svg, .qr-card img { width:100%; height:auto; display:block; }
+  .qr-label { font-size:12px; color:#8a93b8; margin-bottom:8px; text-align:center; }
+  .grid { width:100%; max-width:360px; margin-top:18px;
+          display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  .card { background:rgba(255,255,255,.04); border:1px solid rgba(255,255,255,.07);
+          border-radius:14px; padding:12px 14px; }
+  .card .k { font-size:11px; color:#8a93b8; text-transform:uppercase; letter-spacing:.6px; }
+  .card .v { font-size:18px; font-weight:600; margin-top:4px; font-variant-numeric:tabular-nums; }
+  .err-box { width:100%; max-width:360px; margin-top:16px; font-size:12.5px; line-height:1.5;
+             color:#ffd0d0; background:rgba(239,68,68,.10); border:1px solid rgba(239,68,68,.3);
+             border-radius:12px; padding:12px 14px; display:none; }
+  .err-box.show { display:block; }
+  .hint { margin:18px 0 28px; font-size:12px; color:#6b7396; max-width:360px; text-align:center; line-height:1.5; }
+</style>
+</head>
+<body>
+  <h1>Drift Live GPS</h1>
+  <div class="sub">Pairing this phone with Drift — peer-to-peer, no server.</div>
+
+  <div class="rows">
+    <div class="row"><span class="dot" id="secDot"></span><span class="lbl">Secure</span><span class="val" id="secText">—</span></div>
+    <div class="row"><span class="dot" id="peerDot"></span><span class="lbl">Link</span><span class="val" id="peerText">Building answer…</span></div>
+    <div class="row"><span class="dot" id="gpsDot"></span><span class="lbl">GPS</span><span class="val" id="gpsText">Idle</span></div>
+  </div>
+
+  <div class="qr-label" id="qrLabel">Step 1 — point Drift's webcam at this code:</div>
+  <div class="qr-card" id="qrCard"><span style="color:#888;font-size:13px">preparing…</span></div>
+
+  <button id="toggle">Grant location &amp; Start</button>
+
+  <div class="grid">
+    <div class="card"><div class="k">Latitude</div><div class="v" id="lat">—</div></div>
+    <div class="card"><div class="k">Longitude</div><div class="v" id="lon">—</div></div>
+    <div class="card"><div class="k">Speed</div><div class="v" id="speed">—</div></div>
+    <div class="card"><div class="k">Accuracy</div><div class="v" id="acc">—</div></div>
+  </div>
+
+  <div class="err-box" id="errBox"></div>
+  <div class="hint">Keep this page open while driving. Once Drift reads the QR, GPS streams wirelessly.</div>
+
+<script>
+(function () {
+  "use strict";
+  var $ = function (id) { return document.getElementById(id); };
+  var SEND_INTERVAL_MS = 300; // ~3 Hz
+  var ICE_TIMEOUT_MS = 2500;
+
+  var pc = null, channel = null, watchId = null, wakeLock = null, lastSent = 0, running = false;
+
+  function setPeer(t, c) { $("peerText").textContent = t; $("peerDot").className = "dot" + (c ? " " + c : ""); }
+  function setGps(t, c)  { $("gpsText").textContent = t;  $("gpsDot").className  = "dot" + (c ? " " + c : ""); }
+  function showError(m) { var b = $("errBox"); b.innerHTML = m; b.classList.add("show"); }
+  function hideError() { $("errBox").classList.remove("show"); }
+
+  // ── base64url <-> bytes; raw DEFLATE matches fflate on the Drift side ──────
+  function b64urlToU8(s) {
+    s = s.replace(/-/g, "+").replace(/_/g, "/");
+    var bin = atob(s), u8 = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+    return u8;
+  }
+  function u8ToB64url(u8) {
+    var s = "";
+    for (var i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]);
+    return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+  function unpackSdp(blob) { return pako.inflateRaw(b64urlToU8(blob.trim()), { to: "string" }); }
+  function packSdp(sdp) { return u8ToB64url(pako.deflateRaw(sdp)); }
+
+  function getOfferBlob() {
+    var h = location.hash.replace(/^#/, "");
+    var parts = h.split("&");
+    for (var i = 0; i < parts.length; i++) {
+      var kv = parts[i].split("=");
+      if (kv[0] === "o") return decodeURIComponent(kv.slice(1).join("="));
+    }
+    return null;
+  }
+
+  function waitIceComplete(peer) {
+    return new Promise(function (resolve) {
+      if (peer.iceGatheringState === "complete") return resolve();
+      var t = setTimeout(finish, ICE_TIMEOUT_MS);
+      function finish() { clearTimeout(t); peer.removeEventListener("icegatheringstatechange", check); resolve(); }
+      function check() { if (peer.iceGatheringState === "complete") finish(); }
+      peer.addEventListener("icegatheringstatechange", check);
+    });
+  }
+
+  function showAnswerQr(blob) {
+    var qr = qrcode(0, "L");          // type 0 = auto-fit smallest version
+    qr.addData(blob);
+    qr.make();
+    $("qrCard").innerHTML = qr.createSvgTag({ cellSize: 4, margin: 2 });
+  }
+
+  // Secure-context indicator (geolocation needs HTTPS).
+  if (window.isSecureContext) { $("secText").textContent = "Yes (HTTPS)"; $("secDot").className = "dot on"; }
+  else { $("secText").textContent = "No — geolocation blocked"; $("secDot").className = "dot err";
+         showError("This page is <b>not a secure context</b>. Host it over <b>https://</b>."); }
+
+  // ── Build the WebRTC answer as soon as the page loads ─────────────────────
+  async function buildAnswer() {
+    var offerBlob = getOfferBlob();
+    if (!offerBlob) {
+      setPeer("No offer in link", "err");
+      $("qrCard").innerHTML = '<span style="color:#a00;font-size:13px;padding:20px">Open this page from Drift\u2019s pairing QR.</span>';
+      showError("This link has no pairing offer. In Drift, open <b>Live GPS \u2192 Pair phone</b> and scan the QR it shows.");
+      return;
+    }
+    try {
+      var offerSdp = unpackSdp(offerBlob);
+      pc = new RTCPeerConnection({ iceServers: [] }); // host-only, same-LAN
+      pc.onconnectionstatechange = function () {
+        if (!pc) return;
+        var st = pc.connectionState;
+        if (st === "connected") setPeer("Connected to Drift", "on");
+        else if (st === "failed" || st === "disconnected" || st === "closed") setPeer("Link " + st, "err");
+        else setPeer(st + "\u2026", "warn");
+      };
+      pc.ondatachannel = function (e) {
+        channel = e.channel;
+        channel.onopen = function () { setPeer("Connected to Drift", "on"); };
+        channel.onclose = function () { setPeer("Link closed", "err"); };
+      };
+      await pc.setRemoteDescription({ type: "offer", sdp: offerSdp });
+      var answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      await waitIceComplete(pc);
+      showAnswerQr(packSdp(pc.localDescription.sdp));
+      setPeer("Show this QR to Drift", "warn");
+    } catch (err) {
+      setPeer("Pairing error", "err");
+      showError("Could not build the answer: " + (err && err.message || err));
+    }
+  }
+
+  // ── GPS streaming ─────────────────────────────────────────────────────────
+  var GEO_OPTS = { enableHighAccuracy: true, maximumAge: 0, timeout: 15000 };
+
+  function onPosition(pos) {
+    hideError();
+    var c = pos.coords;
+    setGps("Live — " + c.latitude.toFixed(5) + ", " + c.longitude.toFixed(5), "on");
+    $("lat").textContent = c.latitude.toFixed(6);
+    $("lon").textContent = c.longitude.toFixed(6);
+    $("speed").textContent = (c.speed != null ? (c.speed * 3.6).toFixed(1) + " km/h" : "—");
+    $("acc").textContent = (c.accuracy != null ? c.accuracy.toFixed(0) + " m" : "—");
+
+    var now = Date.now();
+    if (now - lastSent < SEND_INTERVAL_MS) return;
+    lastSent = now;
+    if (channel && channel.readyState === "open") {
+      channel.send(JSON.stringify({
+        type: "gps", lat: c.latitude, lon: c.longitude,
+        heading: c.heading, speed: c.speed, acc: c.accuracy, ts: now
+      }));
+    }
+  }
+
+  function onGeoError(err) {
+    var names = { 1: "PERMISSION_DENIED", 2: "POSITION_UNAVAILABLE", 3: "TIMEOUT" };
+    setGps(names[err.code] || ("CODE_" + err.code), "err");
+    if (err.code === 1) {
+      showError("<b>Location permission denied.</b><br>Settings \u2192 Privacy &amp; Security \u2192 Location Services \u2192 On, " +
+                "then allow your browser to use location, reload and tap Start.");
+    } else if (err.code === 2) {
+      showError("<b>Position unavailable.</b> Disable Airplane mode and get a clear sky view.");
+    } else if (err.code === 3) {
+      showError("<b>GPS timed out.</b> Tap Start again or move to open sky.");
+    }
+  }
+
+  async function requestWakeLock() {
+    try { if ("wakeLock" in navigator) wakeLock = await navigator.wakeLock.request("screen"); }
+    catch (e) { /* non-fatal */ }
+  }
+  document.addEventListener("visibilitychange", function () {
+    if (running && document.visibilityState === "visible" && wakeLock === null) requestWakeLock();
+  });
+
+  var toggle = $("toggle");
+  function start() {
+    if (!("geolocation" in navigator)) { setGps("Not supported", "err"); return; }
+    running = true;
+    toggle.textContent = "Stop";
+    toggle.classList.add("stop");
+    setGps("Requesting permission…", "warn");
+    requestWakeLock();
+    navigator.geolocation.getCurrentPosition(
+      function (pos) { onPosition(pos); startWatch(); },
+      function (err) { onGeoError(err); startWatch(); },
+      GEO_OPTS
+    );
+  }
+  function startWatch() {
+    if (watchId != null) navigator.geolocation.clearWatch(watchId);
+    watchId = navigator.geolocation.watchPosition(onPosition, onGeoError, GEO_OPTS);
+  }
+  function stop() {
+    running = false;
+    toggle.textContent = "Grant location & Start";
+    toggle.classList.remove("stop");
+    setGps("Idle", "");
+    if (watchId != null) { navigator.geolocation.clearWatch(watchId); watchId = null; }
+    if (wakeLock) { try { wakeLock.release(); } catch (e) {} wakeLock = null; }
+  }
+  toggle.addEventListener("click", function () { running ? stop() : start(); });
+
+  buildAnswer();
+})();
+</script>
+</body>
+</html>
