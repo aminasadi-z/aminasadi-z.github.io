@@ -95,6 +95,8 @@
   var ICE_TIMEOUT_MS = 2500;
 
   var pc = null, channel = null, watchId = null, wakeLock = null, lastSent = 0, running = false;
+  var compassHeading = null; // latest IMU compass heading (deg, 0=N), used when slow
+  var GPS_HEADING_MIN_SPEED = 2.0; // m/s (~7 km/h): above this, trust GPS course
 
   function setPeer(t, c) { $("peerText").textContent = t; $("peerDot").className = "dot" + (c ? " " + c : ""); }
   function setGps(t, c)  { $("gpsText").textContent = t;  $("gpsDot").className  = "dot" + (c ? " " + c : ""); }
@@ -199,10 +201,15 @@
     var now = Date.now();
     if (now - lastSent < SEND_INTERVAL_MS) return;
     lastSent = now;
+    // Hybrid heading: GPS course is reliable while moving but null when stopped;
+    // the IMU compass works at standstill. Prefer GPS above the speed gate.
+    var heading = (c.speed != null && c.speed >= GPS_HEADING_MIN_SPEED && c.heading != null)
+      ? c.heading
+      : (compassHeading != null ? compassHeading : c.heading);
     if (channel && channel.readyState === "open") {
       channel.send(JSON.stringify({
         type: "gps", lat: c.latitude, lon: c.longitude,
-        heading: c.heading, speed: c.speed, acc: c.accuracy, ts: now
+        heading: heading, speed: c.speed, acc: c.accuracy, ts: now
       }));
     }
   }
@@ -224,6 +231,25 @@
     try { if ("wakeLock" in navigator) wakeLock = await navigator.wakeLock.request("screen"); }
     catch (e) { /* non-fatal */ }
   }
+
+  // ── IMU compass (heading at standstill) ─────────────────────────────────────
+  function onOrientation(e) {
+    // iOS exposes a true-north compass heading directly; elsewhere derive it
+    // from alpha (deg clockwise from N = 360 - alpha).
+    var h = (typeof e.webkitCompassHeading === "number") ? e.webkitCompassHeading
+          : (e.alpha != null ? (360 - e.alpha) : null);
+    if (h != null && isFinite(h)) compassHeading = (h % 360 + 360) % 360;
+  }
+  async function requestCompass() {
+    try {
+      if (typeof DeviceOrientationEvent !== "undefined" &&
+          typeof DeviceOrientationEvent.requestPermission === "function") {
+        var p = await DeviceOrientationEvent.requestPermission();
+        if (p !== "granted") return;
+      }
+      window.addEventListener("deviceorientation", onOrientation, true);
+    } catch (e) { /* non-fatal — fall back to GPS course only */ }
+  }
   document.addEventListener("visibilitychange", function () {
     if (running && document.visibilityState === "visible" && wakeLock === null) requestWakeLock();
   });
@@ -236,6 +262,7 @@
     toggle.classList.add("stop");
     setGps("Requesting permission…", "warn");
     requestWakeLock();
+    requestCompass();
     navigator.geolocation.getCurrentPosition(
       function (pos) { onPosition(pos); startWatch(); },
       function (err) { onGeoError(err); startWatch(); },
@@ -252,6 +279,8 @@
     toggle.classList.remove("stop");
     setGps("Idle", "");
     if (watchId != null) { navigator.geolocation.clearWatch(watchId); watchId = null; }
+    window.removeEventListener("deviceorientation", onOrientation, true);
+    compassHeading = null;
     if (wakeLock) { try { wakeLock.release(); } catch (e) {} wakeLock = null; }
   }
   toggle.addEventListener("click", function () { running ? stop() : start(); });
