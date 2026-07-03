@@ -400,8 +400,9 @@
     return null;
   }
   async function initRelay(info) {
-    $("qrLabel").textContent = "Relay mode — press Start to stream to Drift.";
-    $("qrCard").innerHTML = '<span style="color:#22c55e;font-size:48px;line-height:1.4">\u2713</span>';
+    // Relay mode shows no QR on the phone (Drift displays it), so drop the card.
+    $("qrLabel").style.display = "none";
+    $("qrCard").style.display = "none";
     setPeer("Connecting to relay\u2026", "warn");
     if (typeof mqtt === "undefined") {
       setPeer("Relay unavailable", "err");
