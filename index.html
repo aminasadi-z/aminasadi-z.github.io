@@ -92,7 +92,8 @@
   "use strict";
   var $ = function (id) { return document.getElementById(id); };
   var SEND_INTERVAL_MS = 100; // ~10 Hz
-  var ICE_TIMEOUT_MS = 2500;
+  var ICE_TIMEOUT_MS = 10000; // cap for ICE gathering; iOS mDNS can be slow, and
+                              // an empty answer SDP breaks the link (see below)
 
   var pc = null, channel = null, watchId = null, wakeLock = null, lastSent = 0, running = false;
   var compassHeading = null; // latest IMU compass heading (deg, 0=N), used when slow
@@ -130,6 +131,11 @@
   }
 
   function waitIceComplete(peer) {
+    // Resolve when ICE gathering completes, or after the cap. Host-only
+    // gathering normally finishes in well under a second, so the cap only bites
+    // when iOS Safari's mDNS host-candidate gathering stalls. Waiting is far
+    // better than snapshotting an EMPTY answer SDP (no a=candidate lines), which
+    // gives Drift zero remote candidates and makes the link fail every time.
     return new Promise(function (resolve) {
       if (peer.iceGatheringState === "complete") return resolve();
       var t = setTimeout(finish, ICE_TIMEOUT_MS);
@@ -167,8 +173,16 @@
         if (!pc) return;
         var st = pc.connectionState;
         if (st === "connected") setPeer("Connected to Drift", "on");
-        else if (st === "failed" || st === "disconnected" || st === "closed") setPeer("Link " + st, "err");
+        else if (st === "failed" || st === "closed") setPeer("Link " + st, "err");
+        else if (st === "disconnected") setPeer("Link dropped — retrying…", "warn");
         else setPeer(st + "\u2026", "warn");
+      };
+      pc.oniceconnectionstatechange = function () {
+        if (!pc) return;
+        var st = pc.iceConnectionState;
+        if (st === "checking") setPeer("Connecting to Drift\u2026", "warn");
+        else if (st === "connected" || st === "completed") setPeer("Connected to Drift", "on");
+        else if (st === "failed") setPeer("Link failed — rescan in Drift", "err");
       };
       pc.ondatachannel = function (e) {
         channel = e.channel;
@@ -179,7 +193,17 @@
       var answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
       await waitIceComplete(pc);
-      showAnswerQr(packSdp(pc.localDescription.sdp));
+      var sdp = pc.localDescription.sdp;
+      // Guard: never show an answer QR with no ICE candidates. Drift would get
+      // zero remote candidates, form no pairs, and the link would always fail.
+      if (!/a=candidate:/.test(sdp)) {
+        setPeer("No network address — reload & rescan", "err");
+        showError("This phone couldn\u2019t gather a network address for the link. " +
+                  "Make sure <b>Personal Hotspot</b> is on and Drift\u2019s laptop is joined to it, " +
+                  "then <b>reload this page</b> and scan Drift\u2019s QR again.");
+        return;
+      }
+      showAnswerQr(packSdp(sdp));
       setPeer("Show this QR to Drift", "warn");
     } catch (err) {
       setPeer("Pairing error", "err");
