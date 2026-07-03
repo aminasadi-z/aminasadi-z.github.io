@@ -88,7 +88,7 @@
 
   <div class="err-box" id="errBox"></div>
   <div class="hint">Keep this page open while driving. Once Drift reads the QR, GPS streams wirelessly.</div>
-  <div class="hint" style="margin-top:-18px;opacity:.55">build 5 · relay</div>
+  <div class="hint" style="margin-top:-18px;opacity:.55">build 6 · relay</div>
 
 <script>
 (function () {
@@ -434,7 +434,22 @@
         clientId: "phone-" + Math.random().toString(36).slice(2, 12),
         clean: true, connectTimeout: 8000, reconnectPeriod: 2000
       });
-      mqttClient.on("connect", function () { setPeer("Relay ready — tap Start", "on"); });
+      mqttClient.on("connect", function () {
+        setPeer(running ? "Relay ready — streaming" : "Relay ready — tap Start", "on");
+        // If GPS is already running (e.g. re-paired by scanning a new QR while
+        // this page stayed open), resume streaming to the new room at once
+        // instead of waiting for the next movement / a second Start tap.
+        if (running) {
+          if (imuFlushTimer == null) imuFlushTimer = setInterval(flushImu, IMU_FLUSH_MS);
+          if (lastCoords) {
+            var c = lastCoords;
+            sendFix({
+              type: "gps", lat: c.latitude, lon: c.longitude,
+              heading: compassHeading, speed: c.speed, acc: c.accuracy, ts: Date.now()
+            });
+          }
+        }
+      });
       mqttClient.on("reconnect", function () { setPeer("Relay reconnecting\u2026", "warn"); });
       mqttClient.on("error", function (err) {
         setPeer("Relay error", "err");
@@ -484,6 +499,29 @@
     if (wakeLock) { try { wakeLock.release(); } catch (e) {} wakeLock = null; }
   }
   toggle.addEventListener("click", function () { running ? stop() : start(); });
+
+  // Disconnect the current broker session without touching the GPS/IMU capture,
+  // so we can re-point at a different room.
+  function teardownRelay() {
+    if (imuFlushTimer != null) { clearInterval(imuFlushTimer); imuFlushTimer = null; }
+    imuBuffer = [];
+    if (mqttClient) { try { mqttClient.end(true); } catch (e) {} mqttClient = null; }
+    cryptoKey = null;
+    topics = null;
+  }
+
+  // Scanning a NEW pairing QR while this page is already open only changes the
+  // URL hash (Safari focuses the existing tab rather than reloading). Re-point
+  // the relay at the new room so the phone follows the new Drift session; if a
+  // stream was already running it resumes automatically on reconnect.
+  window.addEventListener("hashchange", function () {
+    var info = getRelayInfo();
+    if (!info) return;
+    var base = "drift/live/" + info.roomId;
+    if (topics && topics.gps === base + "/g") return; // same room — nothing to do
+    teardownRelay();
+    initRelay(info);
+  });
 
   // Startup: a relay link (`#r=`) streams via the public broker; otherwise fall
   // back to the serverless WebRTC answerer (`#o=`).
