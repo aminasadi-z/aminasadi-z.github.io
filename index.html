@@ -88,17 +88,20 @@
 
   <div class="err-box" id="errBox"></div>
   <div class="hint">Keep this page open while driving. Once Drift reads the QR, GPS streams wirelessly.</div>
-  <div class="hint" style="margin-top:-18px;opacity:.55">build 7 · relay</div>
+  <div class="hint" style="margin-top:-18px;opacity:.55">build 8 · relay</div>
 
 <script>
 (function () {
   "use strict";
   var $ = function (id) { return document.getElementById(id); };
-  var SEND_INTERVAL_MS = 100; // ~10 Hz
+  // GPS fixes are sent as they arrive (watchPosition fires ~1 Hz on its own —
+  // no artificial throttle, so we never drop or delay a real position update).
+  // Heading-only pushes from the compass at standstill get their own slow cap.
+  var HEADING_SEND_INTERVAL_MS = 1000; // compass-only heading pushes when parked: 1 Hz
   var ICE_TIMEOUT_MS = 10000; // cap for ICE gathering; iOS mDNS can be slow, and
                               // an empty answer SDP breaks the link (see below)
 
-  var pc = null, channel = null, watchId = null, wakeLock = null, lastSent = 0, running = false;
+  var pc = null, channel = null, watchId = null, wakeLock = null, lastHeadingSent = 0, running = false;
   var compassHeading = null; // latest IMU compass heading (deg, 0=N), used when slow
   var GPS_HEADING_MIN_SPEED = 2.0; // m/s (~7 km/h): above this, trust GPS course
   var lastCoords = null; // last known position, so compass-only updates can be sent
@@ -313,9 +316,9 @@
       : (compassHeading != null ? compassHeading : c.heading);
     setHeading(heading);
 
+    // Event-driven: emit on every real GPS update (watchPosition self-limits to
+    // ~1 Hz), so a fix is never dropped by a shared throttle.
     var now = Date.now();
-    if (now - lastSent < SEND_INTERVAL_MS) return;
-    lastSent = now;
     sendFix({
       type: "gps", lat: c.latitude, lon: c.longitude,
       heading: heading, speed: c.speed, acc: c.accuracy, ts: now
@@ -354,8 +357,8 @@
     if (c.speed != null && c.speed >= GPS_HEADING_MIN_SPEED) return;
     setHeading(compassHeading);
     var now = Date.now();
-    if (now - lastSent < SEND_INTERVAL_MS) return;
-    lastSent = now;
+    if (now - lastHeadingSent < HEADING_SEND_INTERVAL_MS) return;
+    lastHeadingSent = now;
     sendFix({
       type: "gps", lat: c.latitude, lon: c.longitude,
       heading: compassHeading, speed: c.speed, acc: c.accuracy, ts: now
