@@ -83,11 +83,12 @@
     <div class="card"><div class="k">Longitude</div><div class="v" id="lon">—</div></div>
     <div class="card"><div class="k">Speed</div><div class="v" id="speed">—</div></div>
     <div class="card"><div class="k">Accuracy</div><div class="v" id="acc">—</div></div>
+    <div class="card"><div class="k">Heading</div><div class="v" id="hdg">—</div></div>
   </div>
 
   <div class="err-box" id="errBox"></div>
   <div class="hint">Keep this page open while driving. Once Drift reads the QR, GPS streams wirelessly.</div>
-  <div class="hint" style="margin-top:-18px;opacity:.55">build 4 · relay</div>
+  <div class="hint" style="margin-top:-18px;opacity:.55">build 5 · relay</div>
 
 <script>
 (function () {
@@ -281,6 +282,14 @@
   // ── GPS streaming ─────────────────────────────────────────────────────────
   var GEO_OPTS = { enableHighAccuracy: true, maximumAge: 0, timeout: 15000 };
 
+  function setHeading(deg) {
+    var el = $("hdg");
+    if (deg == null || !isFinite(deg)) { el.textContent = "—"; return; }
+    var d = (deg % 360 + 360) % 360;
+    var dirs = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
+    el.textContent = d.toFixed(0) + "° " + dirs[Math.round(d / 45) % 8];
+  }
+
   function onPosition(pos) {
     hideError();
     var c = pos.coords;
@@ -291,14 +300,16 @@
     $("acc").textContent = (c.accuracy != null ? c.accuracy.toFixed(0) + " m" : "—");
     lastCoords = c;
 
-    var now = Date.now();
-    if (now - lastSent < SEND_INTERVAL_MS) return;
-    lastSent = now;
     // Hybrid heading: GPS course is reliable while moving but null when stopped;
     // the IMU compass works at standstill. Prefer GPS above the speed gate.
     var heading = (c.speed != null && c.speed >= GPS_HEADING_MIN_SPEED && c.heading != null)
       ? c.heading
       : (compassHeading != null ? compassHeading : c.heading);
+    setHeading(heading);
+
+    var now = Date.now();
+    if (now - lastSent < SEND_INTERVAL_MS) return;
+    lastSent = now;
     sendFix({
       type: "gps", lat: c.latitude, lon: c.longitude,
       heading: heading, speed: c.speed, acc: c.accuracy, ts: now
@@ -335,6 +346,7 @@
     var c = lastCoords;
     if (c == null || compassHeading == null) return;
     if (c.speed != null && c.speed >= GPS_HEADING_MIN_SPEED) return;
+    setHeading(compassHeading);
     var now = Date.now();
     if (now - lastSent < SEND_INTERVAL_MS) return;
     lastSent = now;
