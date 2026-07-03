@@ -87,7 +87,7 @@
 
   <div class="err-box" id="errBox"></div>
   <div class="hint">Keep this page open while driving. Once Drift reads the QR, GPS streams wirelessly.</div>
-  <div class="hint" style="margin-top:-18px;opacity:.55">build 3 · relay</div>
+  <div class="hint" style="margin-top:-18px;opacity:.55">build 4 · relay</div>
 
 <script>
 (function () {
@@ -163,7 +163,11 @@
     } else if (mqttClient && cryptoKey && topics) {
       var bytes = new TextEncoder().encode(JSON.stringify(obj));
       encryptBytes(cryptoKey, bytes).then(function (payload) {
-        try { mqttClient.publish(topics.gps, payload, { qos: 0 }); } catch (e) { /* ignore */ }
+        // retain:true → the broker keeps the last fix and delivers it to Drift
+        // the moment it subscribes, so a stationary phone (which only emits one
+        // position at start) still pairs even if it published before Drift was
+        // listening.
+        try { mqttClient.publish(topics.gps, payload, { qos: 0, retain: true }); } catch (e) { /* ignore */ }
       });
     }
   }
