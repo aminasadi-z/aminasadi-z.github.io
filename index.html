@@ -88,7 +88,7 @@
 
   <div class="err-box" id="errBox"></div>
   <div class="hint">Keep this page open while driving. Once Drift reads the QR, GPS streams wirelessly.</div>
-  <div class="hint" style="margin-top:-18px;opacity:.55">build 8 · relay</div>
+  <div class="hint" style="margin-top:-18px;opacity:.55">build 9 · relay</div>
 
 <script>
 (function () {
@@ -339,8 +339,17 @@
   }
 
   async function requestWakeLock() {
-    try { if ("wakeLock" in navigator) wakeLock = await navigator.wakeLock.request("screen"); }
-    catch (e) { /* non-fatal */ }
+    try {
+      if (!("wakeLock" in navigator)) return;
+      wakeLock = await navigator.wakeLock.request("screen");
+      // iOS auto-releases the lock whenever the page is hidden or the screen
+      // dims. Without re-acquiring, the phone then sleeps for the rest of the
+      // drive. Re-request as soon as we're visible and still streaming.
+      wakeLock.addEventListener("release", function () {
+        wakeLock = null;
+        if (running && document.visibilityState === "visible") requestWakeLock();
+      });
+    } catch (e) { wakeLock = null; /* non-fatal (e.g. iOS Low Power Mode) */ }
   }
 
   // ── IMU compass (heading at standstill) ─────────────────────────────────────
