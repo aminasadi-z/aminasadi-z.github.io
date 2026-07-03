@@ -88,7 +88,7 @@
 
   <div class="err-box" id="errBox"></div>
   <div class="hint">Keep this page open while driving. Once Drift reads the QR, GPS streams wirelessly.</div>
-  <div class="hint" style="margin-top:-18px;opacity:.55">build 6 · relay</div>
+  <div class="hint" style="margin-top:-18px;opacity:.55">build 7 · relay</div>
 
 <script>
 (function () {
@@ -111,6 +111,12 @@
   // broker — only the roomId appears in the topic).
   var BROKER_URL = "wss://broker.emqx.io:8084/mqtt";
   var mqttClient = null, cryptoKey = null, topics = null;
+  // DeviceMotion (accel/gyro) streaming is OFF: it added ~20 msg/s to the free
+  // public broker for no benefit (Drift has no IMU consumer yet) and tripped the
+  // broker's rate limit, causing periodic disconnect/reconnect stalls while
+  // driving. Heading is unaffected — it rides in the GPS fix via the GPS-course /
+  // DeviceOrientation-compass fusion. Flip to true once an IMU consumer exists.
+  var IMU_STREAM_ENABLED = false;
   var IMU_FLUSH_MS = 50;      // batch IMU samples every 50ms (~5 samples @100Hz)
   var imuBuffer = [];         // pending IMU samples awaiting the next flush
   var imuFlushTimer = null;
@@ -392,6 +398,7 @@
     });
   }
   async function requestMotion() {
+    if (!IMU_STREAM_ENABLED) return; // IMU streaming disabled (see IMU_STREAM_ENABLED)
     try {
       if (typeof DeviceMotionEvent !== "undefined" &&
           typeof DeviceMotionEvent.requestPermission === "function") {
@@ -432,7 +439,7 @@
       topics = { gps: base + "/g", imu: base + "/i" };
       mqttClient = mqtt.connect(BROKER_URL, {
         clientId: "phone-" + Math.random().toString(36).slice(2, 12),
-        clean: true, connectTimeout: 8000, reconnectPeriod: 2000
+        clean: true, connectTimeout: 8000, reconnectPeriod: 1000
       });
       mqttClient.on("connect", function () {
         setPeer(running ? "Relay ready — streaming" : "Relay ready — tap Start", "on");
@@ -440,7 +447,7 @@
         // this page stayed open), resume streaming to the new room at once
         // instead of waiting for the next movement / a second Start tap.
         if (running) {
-          if (imuFlushTimer == null) imuFlushTimer = setInterval(flushImu, IMU_FLUSH_MS);
+          if (IMU_STREAM_ENABLED && imuFlushTimer == null) imuFlushTimer = setInterval(flushImu, IMU_FLUSH_MS);
           if (lastCoords) {
             var c = lastCoords;
             sendFix({
