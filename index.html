@@ -15,6 +15,7 @@
 -->
 <script src="https://cdn.jsdelivr.net/npm/pako@2.1.0/dist/pako.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5.15.1/dist/mqtt.min.js"></script>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
@@ -100,10 +101,71 @@
   var GPS_HEADING_MIN_SPEED = 2.0; // m/s (~7 km/h): above this, trust GPS course
   var lastCoords = null; // last known position, so compass-only updates can be sent
 
+  // ── Relay (zero-setup MQTT-over-WSS) transport ────────────────────────────
+  // Used when the pairing link carries `#r=roomId.secret` instead of a WebRTC
+  // offer (`#o=`). Works through corporate VPNs that block peer-to-peer LAN
+  // traffic: both sides meet on a public broker over WSS. Payloads are AES-GCM
+  // encrypted with a key derived from the secret (which never touches the
+  // broker — only the roomId appears in the topic).
+  var BROKER_URL = "wss://broker.emqx.io:8084/mqtt";
+  var mqttClient = null, cryptoKey = null, topics = null;
+  var IMU_FLUSH_MS = 50;      // batch IMU samples every 50ms (~5 samples @100Hz)
+  var imuBuffer = [];         // pending IMU samples awaiting the next flush
+  var imuFlushTimer = null;
+
   function setPeer(t, c) { $("peerText").textContent = t; $("peerDot").className = "dot" + (c ? " " + c : ""); }
   function setGps(t, c)  { $("gpsText").textContent = t;  $("gpsDot").className  = "dot" + (c ? " " + c : ""); }
   function showError(m) { var b = $("errBox"); b.innerHTML = m; b.classList.add("show"); }
   function hideError() { $("errBox").classList.remove("show"); }
+
+  // ── Crypto + binary codec (mirror of the Drift-side liveMqtt.js) ──────────
+  async function deriveKey(secret) {
+    var h = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(secret));
+    return crypto.subtle.importKey("raw", h, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
+  }
+  // Wire payload = IV(12) || ciphertext.
+  async function encryptBytes(key, bytes) {
+    var iv = crypto.getRandomValues(new Uint8Array(12));
+    var ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv: iv }, key, bytes));
+    var out = new Uint8Array(12 + ct.length);
+    out.set(iv, 0); out.set(ct, 12);
+    return out;
+  }
+  // IMU batch: u8 version=1, f64 batchTs, u16 count,
+  //   count × [f32 dt, f32 ax, f32 ay, f32 az, f32 gx, f32 gy, f32 gz]
+  function encodeImuBatch(batchTs, samples) {
+    var buf = new ArrayBuffer(11 + samples.length * 28);
+    var dv = new DataView(buf);
+    dv.setUint8(0, 1);
+    dv.setFloat64(1, batchTs, true);
+    dv.setUint16(9, samples.length, true);
+    var o = 11;
+    for (var i = 0; i < samples.length; i++) {
+      var s = samples[i];
+      dv.setFloat32(o, s.dt, true);
+      dv.setFloat32(o + 4, s.ax, true);
+      dv.setFloat32(o + 8, s.ay, true);
+      dv.setFloat32(o + 12, s.az, true);
+      dv.setFloat32(o + 16, s.gx, true);
+      dv.setFloat32(o + 20, s.gy, true);
+      dv.setFloat32(o + 24, s.gz, true);
+      o += 28;
+    }
+    return new Uint8Array(buf);
+  }
+
+  // Transport-agnostic GPS send: WebRTC data channel when paired that way, else
+  // the encrypted MQTT relay.
+  function sendFix(obj) {
+    if (channel && channel.readyState === "open") {
+      channel.send(JSON.stringify(obj));
+    } else if (mqttClient && cryptoKey && topics) {
+      var bytes = new TextEncoder().encode(JSON.stringify(obj));
+      encryptBytes(cryptoKey, bytes).then(function (payload) {
+        try { mqttClient.publish(topics.gps, payload, { qos: 0 }); } catch (e) { /* ignore */ }
+      });
+    }
+  }
 
   // ── base64url <-> bytes; raw DEFLATE matches fflate on the Drift side ──────
   function b64urlToU8(s) {
@@ -232,12 +294,10 @@
     var heading = (c.speed != null && c.speed >= GPS_HEADING_MIN_SPEED && c.heading != null)
       ? c.heading
       : (compassHeading != null ? compassHeading : c.heading);
-    if (channel && channel.readyState === "open") {
-      channel.send(JSON.stringify({
-        type: "gps", lat: c.latitude, lon: c.longitude,
-        heading: heading, speed: c.speed, acc: c.accuracy, ts: now
-      }));
-    }
+    sendFix({
+      type: "gps", lat: c.latitude, lon: c.longitude,
+      heading: heading, speed: c.speed, acc: c.accuracy, ts: now
+    });
   }
 
   function onGeoError(err) {
@@ -273,12 +333,10 @@
     var now = Date.now();
     if (now - lastSent < SEND_INTERVAL_MS) return;
     lastSent = now;
-    if (channel && channel.readyState === "open") {
-      channel.send(JSON.stringify({
-        type: "gps", lat: c.latitude, lon: c.longitude,
-        heading: compassHeading, speed: c.speed, acc: c.accuracy, ts: now
-      }));
-    }
+    sendFix({
+      type: "gps", lat: c.latitude, lon: c.longitude,
+      heading: compassHeading, speed: c.speed, acc: c.accuracy, ts: now
+    });
   }
   async function requestCompass() {
     try {
@@ -289,6 +347,85 @@
       }
       window.addEventListener("deviceorientation", onOrientation, true);
     } catch (e) { /* non-fatal — fall back to GPS course only */ }
+  }
+
+  // ── IMU streaming (relay mode only): batch DeviceMotion @~100Hz ─────────────
+  function onMotion(e) {
+    if (!mqttClient) return;
+    var a = e.accelerationIncludingGravity || e.acceleration || {};
+    var r = e.rotationRate || {};
+    imuBuffer.push({
+      t: Date.now(),
+      ax: a.x || 0, ay: a.y || 0, az: a.z || 0,
+      gx: r.alpha || 0, gy: r.beta || 0, gz: r.gamma || 0
+    });
+  }
+  function flushImu() {
+    if (!mqttClient || !cryptoKey || !topics || imuBuffer.length === 0) return;
+    var batch = imuBuffer; imuBuffer = [];
+    var batchTs = batch[0].t;
+    var samples = new Array(batch.length);
+    for (var i = 0; i < batch.length; i++) {
+      var s = batch[i];
+      samples[i] = { dt: s.t - batchTs, ax: s.ax, ay: s.ay, az: s.az, gx: s.gx, gy: s.gy, gz: s.gz };
+    }
+    var bytes = encodeImuBatch(batchTs, samples);
+    encryptBytes(cryptoKey, bytes).then(function (payload) {
+      try { mqttClient.publish(topics.imu, payload, { qos: 0 }); } catch (e) { /* ignore */ }
+    });
+  }
+  async function requestMotion() {
+    try {
+      if (typeof DeviceMotionEvent !== "undefined" &&
+          typeof DeviceMotionEvent.requestPermission === "function") {
+        var p = await DeviceMotionEvent.requestPermission();
+        if (p !== "granted") return;
+      }
+      window.addEventListener("devicemotion", onMotion, true);
+      if (imuFlushTimer == null) imuFlushTimer = setInterval(flushImu, IMU_FLUSH_MS);
+    } catch (e) { /* non-fatal — GPS still streams without IMU */ }
+  }
+
+  // ── Relay mode: parse `#r=roomId.secret`, connect to the public broker ──────
+  function getRelayInfo() {
+    var h = location.hash.replace(/^#/, "");
+    var parts = h.split("&");
+    for (var i = 0; i < parts.length; i++) {
+      var kv = parts[i].split("=");
+      if (kv[0] === "r") {
+        var v = decodeURIComponent(kv.slice(1).join("=")).split(".");
+        if (v.length === 2 && v[0] && v[1]) return { roomId: v[0], secret: v[1] };
+      }
+    }
+    return null;
+  }
+  async function initRelay(info) {
+    $("qrLabel").textContent = "Relay mode — press Start to stream to Drift.";
+    $("qrCard").innerHTML = '<span style="color:#22c55e;font-size:48px;line-height:1.4">\u2713</span>';
+    setPeer("Connecting to relay\u2026", "warn");
+    if (typeof mqtt === "undefined") {
+      setPeer("Relay unavailable", "err");
+      showError("Could not load the relay library. Check your connection and reload.");
+      return;
+    }
+    try {
+      cryptoKey = await deriveKey(info.secret);
+      var base = "drift/live/" + info.roomId;
+      topics = { gps: base + "/g", imu: base + "/i" };
+      mqttClient = mqtt.connect(BROKER_URL, {
+        clientId: "phone-" + Math.random().toString(36).slice(2, 12),
+        clean: true, connectTimeout: 8000, reconnectPeriod: 2000
+      });
+      mqttClient.on("connect", function () { setPeer("Relay ready — tap Start", "on"); });
+      mqttClient.on("reconnect", function () { setPeer("Relay reconnecting\u2026", "warn"); });
+      mqttClient.on("error", function (err) {
+        setPeer("Relay error", "err");
+        showError("Relay error: " + (err && err.message || err));
+      });
+    } catch (err) {
+      setPeer("Relay setup failed", "err");
+      showError("Could not set up the relay: " + (err && err.message || err));
+    }
   }
   document.addEventListener("visibilitychange", function () {
     if (running && document.visibilityState === "visible" && wakeLock === null) requestWakeLock();
@@ -303,6 +440,7 @@
     setGps("Requesting permission…", "warn");
     requestWakeLock();
     requestCompass();
+    if (mqttClient) requestMotion();
     navigator.geolocation.getCurrentPosition(
       function (pos) { onPosition(pos); startWatch(); },
       function (err) { onGeoError(err); startWatch(); },
@@ -320,13 +458,19 @@
     setGps("Idle", "");
     if (watchId != null) { navigator.geolocation.clearWatch(watchId); watchId = null; }
     window.removeEventListener("deviceorientation", onOrientation, true);
+    window.removeEventListener("devicemotion", onMotion, true);
+    if (imuFlushTimer != null) { clearInterval(imuFlushTimer); imuFlushTimer = null; }
+    imuBuffer = [];
     compassHeading = null;
     lastCoords = null;
     if (wakeLock) { try { wakeLock.release(); } catch (e) {} wakeLock = null; }
   }
   toggle.addEventListener("click", function () { running ? stop() : start(); });
 
-  buildAnswer();
+  // Startup: a relay link (`#r=`) streams via the public broker; otherwise fall
+  // back to the serverless WebRTC answerer (`#o=`).
+  var relayInfo = getRelayInfo();
+  if (relayInfo) initRelay(relayInfo); else buildAnswer();
 })();
 </script>
 </body>
